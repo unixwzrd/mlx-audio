@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -10,6 +10,7 @@ from mlx_audio.utils import base_load_model, get_model_path, load_config
 SAMPLE_RATE = 16000
 
 MODEL_REMAPPING = {
+    "cohere_asr": "cohere_asr",
     "fireredasr2": "fireredasr2",
     "glm": "glmasr",
     "sensevoice": "sensevoice",
@@ -21,17 +22,15 @@ MODEL_REMAPPING = {
     "moonshine": "moonshine",
     "mms": "mms",
     "granite_speech": "granite_speech",
+    "qwen2_audio": "qwen2_audio",
+    "mega_asr": "mega_asr",
 }
 
 
 def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    from scipy import signal
+    from mlx_audio.utils import resample_audio as _resample_audio
 
-    gcd = np.gcd(orig_sr, target_sr)
-    up = target_sr // gcd
-    down = orig_sr // gcd
-    resampled = signal.resample_poly(audio, up, down, padtype="edge")
-    return resampled
+    return _resample_audio(audio, orig_sr, target_sr, axis=0)
 
 
 def load_audio(
@@ -64,7 +63,10 @@ def load_audio(
 
 
 def load_model(
-    model_path: Union[str, Path], lazy: bool = False, strict: bool = False, **kwargs
+    model_path: Union[str, Path],
+    lazy: bool = False,
+    strict: bool = False,
+    **kwargs: Any,
 ) -> nn.Module:
     """
     Load and initialize an STT model from a given path.
@@ -89,7 +91,10 @@ def load_model(
 
 
 def load(
-    model_path: Union[str, Path], lazy: bool = False, strict: bool = False, **kwargs
+    model_path: Union[str, Path],
+    lazy: bool = False,
+    strict: bool = False,
+    **kwargs: Any,
 ) -> nn.Module:
     """
     Load a speech-to-text model from a local path or HuggingFace repository.
@@ -101,16 +106,11 @@ def load(
         model_path: The local path or HuggingFace repo ID to load from.
         lazy: If False, evaluate model parameters immediately.
         strict: If True, raise an error if any weights are missing.
-        **kwargs: Additional keyword arguments:
-            - revision (str): HuggingFace revision/branch to use
-            - force_download (bool): Force re-download of model files
+        **kwargs: Additional keyword arguments such as `revision` and
+            `force_download`.
 
     Returns:
         nn.Module: The loaded and initialized model.
 
-    Example:
-        >>> from mlx_audio.stt import load
-        >>> model = load("mlx-community/whisper-tiny-asr-fp16")
-        >>> result = model.generate(audio)
     """
     return load_model(model_path, lazy=lazy, strict=strict, **kwargs)

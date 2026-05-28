@@ -1,7 +1,9 @@
 import argparse
+import inspect
 import os
 import sys
-from typing import Optional, Tuple, Union
+from os import PathLike
+from typing import Any, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -102,10 +104,54 @@ def hertz_to_mel(pitch: float) -> float:
     return mel
 
 
+def write_joined_audio(
+    file_name: str,
+    audio_chunks: list,
+    sample_rate: int,
+    audio_format: str,
+) -> None:
+    if not audio_chunks:
+        return
+
+    audio = (
+        mx.concatenate(audio_chunks, axis=0)
+        if len(audio_chunks) > 1
+        else audio_chunks[0]
+    )
+    audio_write(file_name, audio, sample_rate, format=audio_format)
+
+
+def _as_reference_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _collapse_reference_list(values: list[Any]) -> Any:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return values
+
+
+def _model_accepts_ref_text(model: nn.Module) -> bool:
+    try:
+        return "ref_text" in inspect.signature(model.generate).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _model_preserves_ref_audio_paths(model: nn.Module) -> bool:
+    return getattr(model, "preserve_ref_audio_path", False) is True
+
+
 def generate_audio(
     text: str,
     model: Optional[Union[str, nn.Module]] = None,
-    max_tokens: int = 1200,
+    max_tokens: Optional[int] = 1200,
     voice: str = "af_heart",
     prompt: Optional[str] = None,
     instruct: Optional[str] = None,
@@ -114,8 +160,8 @@ def generate_audio(
     cfg_scale: Optional[float] = None,
     ddpm_steps: Optional[int] = None,
     sigma: Optional[float] = None,
-    ref_audio: Optional[str] = None,
-    ref_text: Optional[str] = None,
+    ref_audio: Optional[Union[str, list[str]]] = None,
+    ref_text: Optional[Union[str, list[str]]] = None,
     stt_model: Optional[
         Union[str, nn.Module]
     ] = "mlx-community/whisper-large-v3-turbo-asr-fp16",
@@ -128,6 +174,7 @@ def generate_audio(
     temperature: float = 0.7,
     stream: bool = False,
     streaming_interval: float = 2.0,
+    save: bool = False,
     use_zero_spk_emb: bool = False,
     **kwargs,
 ) -> None:
@@ -151,10 +198,11 @@ def generate_audio(
     - join_audio (bool): Whether to join multiple audio files into one.
     - play (bool): Whether to play the generated audio.
     - verbose (bool): Whether to print status messages.
+    - save (bool): Whether to save streamed audio to a file when using stream mode.
     - model (object): A already loaded model.
     - stt_model (object): A already loaded stt model.
     Returns:
-    - None: The function writes the generated audio to a file.
+    - None: The function writes the generated audio to a file when not streaming, or when streaming with saving enabled.
     """
     try:
         play = play or stream
@@ -162,41 +210,90 @@ def generate_audio(
         if model is None:
             raise ValueError("Model path or model instance must be provided.")
 
-        if stt_model is None and (ref_audio and ref_text is None):
-            raise ValueError(
-                "STT model path or model instance must be provided when ref_text is missing."
-            )
-
         if isinstance(model, str):
             # Load model
             model = load_model(model_path=model)
 
-        # Load reference audio for voice matching if specified
-        if ref_audio:
-            if not os.path.exists(ref_audio):
-                raise FileNotFoundError(f"Reference audio file not found: {ref_audio}")
+        ref_audio_values = _as_reference_list(ref_audio)
+        ref_text_values = _as_reference_list(ref_text)
+        if (
+            ref_audio_values
+            and ref_text_values
+            and len(ref_text_values) != len(ref_audio_values)
+        ):
+            raise ValueError("ref_audio and ref_text lists must have the same length.")
+        if len(ref_text_values) > 1 and not ref_audio_values:
+            raise ValueError(
+                "Multiple ref_text values require matching ref_audio values."
+            )
 
+        # Load reference audio for voice matching if specified. Some models own
+        # reference preprocessing and should receive paths unchanged.
+        if ref_audio_values:
             normalize = False
             if hasattr(model, "model_type") and model.model_type == "spark":
                 normalize = True
 
-            ref_audio = load_audio(
-                ref_audio, sample_rate=model.sample_rate, volume_normalize=normalize
-            )
-            if not ref_text:
-                import inspect
+            preserve_ref_paths = _model_preserves_ref_audio_paths(model)
+            if preserve_ref_paths:
+                loaded_ref_audio = []
+                for ref_audio_item in ref_audio_values:
+                    if isinstance(ref_audio_item, (str, PathLike)):
+                        ref_audio_path = os.fspath(ref_audio_item)
+                        if not os.path.exists(ref_audio_path):
+                            raise FileNotFoundError(
+                                f"Reference audio file not found: {ref_audio_path}"
+                            )
+                        loaded_ref_audio.append(ref_audio_path)
+                    else:
+                        loaded_ref_audio.append(ref_audio_item)
+            else:
+                loaded_ref_audio = []
+                for ref_audio_item in ref_audio_values:
+                    if isinstance(ref_audio_item, (str, PathLike)):
+                        ref_audio_path = os.fspath(ref_audio_item)
+                        if not os.path.exists(ref_audio_path):
+                            raise FileNotFoundError(
+                                f"Reference audio file not found: {ref_audio_path}"
+                            )
+                        loaded_ref_audio.append(
+                            load_audio(
+                                ref_audio_path,
+                                sample_rate=model.sample_rate,
+                                volume_normalize=normalize,
+                            )
+                        )
+                    else:
+                        loaded_ref_audio.append(ref_audio_item)
+            ref_audio = _collapse_reference_list(loaded_ref_audio)
 
-                if "ref_text" in inspect.signature(model.generate).parameters:
-                    print("Ref_text not found. Transcribing ref_audio...")
-                    from mlx_audio.stt import load as load_stt_model
+            if ref_text_values:
+                ref_text = _collapse_reference_list(ref_text_values)
+            elif preserve_ref_paths:
+                ref_text = None
+            elif _model_accepts_ref_text(model):
+                if stt_model is None:
+                    raise ValueError(
+                        "STT model path or model instance must be provided when "
+                        "ref_text is missing."
+                    )
+                print("Ref_text not found. Transcribing ref_audio...")
+                from mlx_audio.stt import load as load_stt_model
 
-                    if isinstance(stt_model, str):
-                        stt_model = load_stt_model(stt_model)
-                    ref_text = stt_model.generate(ref_audio).text
+                if isinstance(stt_model, str):
+                    stt_model = load_stt_model(stt_model)
+                transcribed_ref_text = [
+                    stt_model.generate(audio).text for audio in loaded_ref_audio
+                ]
 
-                    del stt_model
-                    mx.clear_cache()
-                    print(f"\033[94mRef_text:\033[0m {ref_text}")
+                del stt_model
+                mx.clear_cache()
+                ref_text = _collapse_reference_list(transcribed_ref_text)
+                print(f"\033[94mRef_text:\033[0m {ref_text}")
+            else:
+                ref_text = None
+        elif ref_text_values:
+            ref_text = _collapse_reference_list(ref_text_values)
 
         # Load AudioPlayer
         player = AudioPlayer(sample_rate=model.sample_rate) if play else None
@@ -216,6 +313,10 @@ def generate_audio(
             f"\033[94mLanguage:\033[0m {lang_code}"
         )
 
+        extra_kwargs = {
+            key: value for key, value in kwargs.items() if value is not None
+        }
+
         gen_kwargs = dict(
             text=text,
             voice=voice,
@@ -223,17 +324,20 @@ def generate_audio(
             lang_code=lang_code,
             ref_audio=ref_audio,
             ref_text=ref_text,
-            cfg_scale=cfg_scale,
-            ddpm_steps=ddpm_steps,
             temperature=temperature,
-            max_tokens=max_tokens,
             verbose=verbose,
             stream=stream,
             streaming_interval=streaming_interval,
             instruct=instruct,
             use_zero_spk_emb=use_zero_spk_emb,
-            **kwargs,
+            **extra_kwargs,
         )
+        if max_tokens is not None:
+            gen_kwargs["max_tokens"] = max_tokens
+        if cfg_scale is not None:
+            gen_kwargs["cfg_scale"] = cfg_scale
+        if ddpm_steps is not None:
+            gen_kwargs["ddpm_steps"] = ddpm_steps
         if prompt is not None:
             gen_kwargs["prompt"] = prompt
         if sigma is not None:
@@ -241,13 +345,26 @@ def generate_audio(
 
         results = model.generate(**gen_kwargs)
 
+        save_streamed_audio = stream and save
         audio_list = []
+        streamed_audio_chunks = []
+        streamed_segment_audio = {}
+        streamed_segment_sample_rates = {}
         file_name = f"{file_prefix}.{audio_format}"
         for i, result in enumerate(results):
             if play:
                 player.queue_audio(result.audio)
 
-            if join_audio:
+            if save_streamed_audio:
+                if join_audio:
+                    streamed_audio_chunks.append(result.audio)
+                else:
+                    segment_idx = result.segment_idx
+                    if segment_idx not in streamed_segment_audio:
+                        streamed_segment_audio[segment_idx] = []
+                        streamed_segment_sample_rates[segment_idx] = result.sample_rate
+                    streamed_segment_audio[segment_idx].append(result.audio)
+            elif join_audio and not stream:
                 audio_list.append(result.audio)
             elif not stream:
                 file_name = f"{file_prefix}_{i:03d}.{audio_format}"
@@ -276,14 +393,42 @@ def generate_audio(
                 print(f"Processing time:       {result.processing_time_seconds:.2f}s")
                 print(f"Peak memory usage:     {result.peak_memory_usage:.2f}GB")
 
-        if join_audio and not stream:
+        if save_streamed_audio and join_audio and streamed_audio_chunks:
+            if verbose:
+                print(f"Joining {len(streamed_audio_chunks)} streamed audio chunks")
+            write_joined_audio(
+                file_name,
+                streamed_audio_chunks,
+                model.sample_rate,
+                audio_format,
+            )
+            print(f"✅ Audio successfully generated and saving as: {file_name}")
+        elif save_streamed_audio and streamed_segment_audio:
+            for segment_idx in sorted(streamed_segment_audio):
+                file_name = f"{file_prefix}_{segment_idx:03d}.{audio_format}"
+                audio_chunks = streamed_segment_audio[segment_idx]
+                sample_rate = streamed_segment_sample_rates[segment_idx]
+                if verbose:
+                    print(
+                        "Joining "
+                        f"{len(audio_chunks)} streamed audio chunks for segment "
+                        f"{segment_idx}"
+                    )
+                write_joined_audio(
+                    file_name,
+                    audio_chunks,
+                    sample_rate,
+                    audio_format,
+                )
+                print(f"✅ Audio successfully generated and saving as: {file_name}")
+        elif join_audio and not stream and audio_list:
             if verbose:
                 print(f"Joining {len(audio_list)} audio files")
-            audio = mx.concatenate(audio_list, axis=0)
-            audio_write(
-                f"{file_prefix}.{audio_format}",
-                audio,
+            write_joined_audio(
+                file_name,
+                audio_list,
                 model.sample_rate,
+                audio_format,
             )
             if verbose:
                 print(f"✅ Audio successfully generated and saving as: {file_name}")
@@ -315,7 +460,7 @@ def parse_args():
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=1200,
+        default=None,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
@@ -351,8 +496,8 @@ def parse_args():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=1.5,
-        help="Classifier-free guidance scale. Lower (≈1.0-1.5) is often more stable.",
+        default=None,
+        help="Classifier-free guidance scale. Defaults to the model configuration.",
     )
     parser.add_argument(
         "--ddpm_steps",
@@ -362,6 +507,41 @@ def parse_args():
     )
 
     parser.add_argument("--speed", type=float, default=1.0, help="Speed of the audio")
+    parser.add_argument(
+        "--gen_duration",
+        type=float,
+        default=None,
+        help="Optional model-specific generation duration in seconds.",
+    )
+    parser.add_argument(
+        "--duration_multiplier",
+        type=float,
+        default=None,
+        help="Optional model-specific automatic duration multiplier.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Optional model-specific generation step count.",
+    )
+    parser.add_argument(
+        "--stg_scale",
+        type=float,
+        default=None,
+        help="Optional model-specific spatiotemporal guidance scale.",
+    )
+    parser.add_argument(
+        "--stg_block",
+        type=int,
+        default=None,
+        help="Optional model-specific spatiotemporal guidance block.",
+    )
+    parser.add_argument(
+        "--rescale_scale",
+        default=None,
+        help="Optional model-specific CFG rescale value.",
+    )
     parser.add_argument(
         "--gender", type=str, default="male", help="Gender of the voice [male, female]"
     )
@@ -383,10 +563,18 @@ def parse_args():
         "--audio_format", type=str, default="wav", help="Output audio format"
     )
     parser.add_argument(
-        "--ref_audio", type=str, default=None, help="Path to reference audio"
+        "--ref_audio",
+        type=str,
+        action="append",
+        default=None,
+        help="Path to reference audio. Repeat for multiple references.",
     )
     parser.add_argument(
-        "--ref_text", type=str, default=None, help="Caption for reference audio"
+        "--ref_text",
+        type=str,
+        action="append",
+        default=None,
+        help="Caption for reference audio. Repeat to match repeated --ref_audio.",
     )
     parser.add_argument(
         "--stt_model",
@@ -419,7 +607,7 @@ def parse_args():
     parser.add_argument(
         "--stream",
         action="store_true",
-        help="Stream the audio as segments instead of saving to a file",
+        help="Stream the audio as segments during generation",
     )
     parser.add_argument(
         "--streaming_interval",
@@ -427,8 +615,16 @@ def parse_args():
         default=2.0,
         help="The time interval in seconds for streaming segments",
     )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save streamed audio to a file. Requires --stream.",
+    )
 
     args = parser.parse_args()
+
+    if args.save and not args.stream:
+        parser.error("--save requires --stream")
 
     if args.text is None:
         if not sys.stdin.isatty():

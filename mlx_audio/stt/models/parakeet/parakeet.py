@@ -37,28 +37,6 @@ from mlx_audio.utils import from_dict
 
 
 @dataclass
-class PreprocessArgs:
-    sample_rate: int
-    normalize: str
-    window_size: float
-    window_stride: float
-    window: str
-    features: int
-    n_fft: int
-    dither: float
-    pad_to: int = 0
-    pad_value: float = 0
-
-    @property
-    def win_length(self) -> int:
-        return int(self.window_size * self.sample_rate)
-
-    @property
-    def hop_length(self) -> int:
-        return int(self.window_stride * self.sample_rate)
-
-
-@dataclass
 class TDTDecodingArgs:
     model_type: str
     durations: list[int]
@@ -141,6 +119,12 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, config: dict) -> "ModelConfig":
+        # Ensure model_type is present so downstream tools (e.g. omlx model
+        # discovery) can identify this as a Parakeet STT model without relying
+        # solely on directory-name heuristics.  NeMo-format config.json files
+        # omit this field; we inject it here if absent.
+        if "model_type" not in config:
+            config = {**config, "model_type": "parakeet"}
         return cls(config)
 
 
@@ -197,7 +181,7 @@ class Model(nn.Module):
             chunk_duration: Optional chunk duration in seconds. Defaults to no
                 chunking for non-streaming and 5.0s for streaming.
             overlap_duration: Optional overlap between chunks in seconds.
-                Defaults to 15.0s for non-streaming chunking and 1.0s for
+                Defaults to 2.0s for non-streaming chunking and 1.0s for
                 streaming.
             chunk_callback: A function to call back when chunk is processed, called with (current_position, total_position)
             stream: If True, yields streaming results instead of returning final result
@@ -232,7 +216,7 @@ class Model(nn.Module):
         if chunk_duration is None:
             return self.decode_chunk(audio_data, verbose)
 
-        overlap_duration = 15.0 if overlap_duration is None else overlap_duration
+        overlap_duration = 2.0 if overlap_duration is None else overlap_duration
 
         if overlap_duration >= chunk_duration:
             raise ValueError(
@@ -515,6 +499,7 @@ class ParakeetTDT(Model):
 
         self.vocabulary = args.joint.vocabulary
         self.durations = args.decoding.durations
+        self.blank_id = len(self.vocabulary)
         self.max_symbols: int | None = (
             args.decoding.greedy.get("max_symbols", None)
             if args.decoding.greedy
@@ -524,6 +509,42 @@ class ParakeetTDT(Model):
         self.encoder = Conformer(args.encoder)
         self.decoder = PredictNetwork(args.decoder)
         self.joint = JointNetwork(args.joint)
+        self._compiled_tdt_step = mx.compile(self._tdt_step)
+
+    def _make_initial_decoder_state(
+        self, batch_size: int, dtype: mx.Dtype
+    ) -> tuple[mx.array, mx.array]:
+        dec_rnn = self.decoder.prediction["dec_rnn"]
+        shape = (dec_rnn.num_layers, batch_size, dec_rnn.hidden_size)
+        zeros = mx.zeros(shape, dtype=dtype)
+        return zeros, zeros
+
+    def _tdt_step(
+        self,
+        feature: mx.array,
+        current_token: mx.array,
+        hidden: mx.array,
+        cell: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+        embedded = self.decoder.prediction["embed"](current_token)
+        blank_mask = mx.expand_dims(current_token == self.blank_id, axis=-1)
+        embedded = mx.where(blank_mask, mx.zeros_like(embedded), embedded)
+
+        decoder_output, (hidden_out, cell_out) = self.decoder.prediction["dec_rnn"](
+            embedded, (hidden, cell)
+        )
+        decoder_output = decoder_output.astype(feature.dtype)
+        hidden_out = hidden_out.astype(feature.dtype)
+        cell_out = cell_out.astype(feature.dtype)
+
+        joint_output = self.joint(feature, decoder_output)
+        pred_token = mx.argmax(joint_output[0, 0, :, : self.blank_id + 1]).astype(
+            mx.int32
+        )
+        decision = mx.argmax(joint_output[0, 0, :, self.blank_id + 1 :]).astype(
+            mx.int32
+        )
+        return pred_token, decision, hidden_out, cell_out
 
     def decode(self, mel: mx.array) -> list[AlignedResult]:
         """
@@ -543,63 +564,49 @@ class ParakeetTDT(Model):
             features = batch_features[b : b + 1]
             max_length = int(lengths[b])
 
-            last_token = len(
-                self.vocabulary
-            )  # In TDT, space token is always len(vocab)
+            last_token = self.blank_id
             hypothesis = []
 
             time = 0
             new_symbols = 0
-            decoder_hidden = None
+            decoder_hidden = self._make_initial_decoder_state(1, features.dtype)
 
             while time < max_length:
                 feature = features[:, time : time + 1]
 
-                current_token = (
-                    mx.array([[last_token]], dtype=mx.int32)
-                    if last_token != len(self.vocabulary)
-                    else None
+                current_token = mx.array([[last_token]], dtype=mx.int32)
+                pred_token, decision, hidden, cell = self._compiled_tdt_step(
+                    feature, current_token, decoder_hidden[0], decoder_hidden[1]
                 )
-                decoder_output, (hidden, cell) = self.decoder(
-                    current_token, decoder_hidden
-                )
+                mx.eval(pred_token, decision, hidden, cell)
 
-                # cast
-                decoder_output = decoder_output.astype(feature.dtype)
-                proposed_decoder_hidden = (
-                    hidden.astype(feature.dtype),
-                    cell.astype(feature.dtype),
-                )
+                pred_token_i = int(pred_token)
+                decision_i = int(decision)
+                duration_i = self.durations[decision_i]
 
-                joint_output = self.joint(feature, decoder_output)
-
-                pred_token = mx.argmax(
-                    joint_output[0, 0, :, : len(self.vocabulary) + 1]
-                )
-                decision = mx.argmax(joint_output[0, 0, :, len(self.vocabulary) + 1 :])
-
-                if pred_token != len(self.vocabulary):
-                    hypothesis.append(
-                        AlignedToken(
-                            int(pred_token),
-                            start=time
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
-                            duration=self.durations[int(decision)]
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
-                            text=tokenizer.decode([int(pred_token)], self.vocabulary),
+                if pred_token_i != self.blank_id:
+                    last_token = pred_token_i
+                    decoder_hidden = (hidden, cell)
+                    if not tokenizer.is_special_token(last_token, self.vocabulary):
+                        hypothesis.append(
+                            AlignedToken(
+                                last_token,
+                                start=time
+                                * self.encoder_config.subsampling_factor
+                                / self.preprocessor_config.sample_rate
+                                * self.preprocessor_config.hop_length,
+                                duration=duration_i
+                                * self.encoder_config.subsampling_factor
+                                / self.preprocessor_config.sample_rate
+                                * self.preprocessor_config.hop_length,
+                                text=tokenizer.decode([last_token], self.vocabulary),
+                            )
                         )
-                    )
-                    last_token = int(pred_token)
-                    decoder_hidden = proposed_decoder_hidden
 
-                time += self.durations[int(decision)]
+                time += duration_i
                 new_symbols += 1
 
-                if self.durations[int(decision)] != 0:
+                if duration_i != 0:
                     new_symbols = 0
                 else:
                     if self.max_symbols is not None and self.max_symbols <= new_symbols:
@@ -681,22 +688,23 @@ class ParakeetRNNT(Model):
                 pred_token = mx.argmax(joint_output)
 
                 if pred_token != len(self.vocabulary):
-                    hypothesis.append(
-                        AlignedToken(
-                            int(pred_token),
-                            start=time
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
-                            duration=1
-                            * self.encoder_config.subsampling_factor
-                            / self.preprocessor_config.sample_rate
-                            * self.preprocessor_config.hop_length,  # hop
-                            text=tokenizer.decode([int(pred_token)], self.vocabulary),
-                        )
-                    )
                     last_token = int(pred_token)
                     decoder_hidden = proposed_decoder_hidden
+                    if not tokenizer.is_special_token(last_token, self.vocabulary):
+                        hypothesis.append(
+                            AlignedToken(
+                                last_token,
+                                start=time
+                                * self.encoder_config.subsampling_factor
+                                / self.preprocessor_config.sample_rate
+                                * self.preprocessor_config.hop_length,
+                                duration=1
+                                * self.encoder_config.subsampling_factor
+                                / self.preprocessor_config.sample_rate
+                                * self.preprocessor_config.hop_length,
+                                text=tokenizer.decode([last_token], self.vocabulary),
+                            )
+                        )
 
                     new_symbols += 1
                     if self.max_symbols is not None and self.max_symbols <= new_symbols:
@@ -759,7 +767,9 @@ class ParakeetCTC(Model):
                 if token_idx == prev_token:
                     continue
 
-                if prev_token != -1:
+                if prev_token != -1 and not tokenizer.is_special_token(
+                    prev_token, self.vocabulary
+                ):
                     token_start_time = (
                         token_boundaries[-1][0]
                         * self.encoder_config.subsampling_factor
@@ -788,7 +798,9 @@ class ParakeetCTC(Model):
                 token_boundaries.append((t, None))
                 prev_token = token_idx
 
-            if prev_token != -1:
+            if prev_token != -1 and not tokenizer.is_special_token(
+                prev_token, self.vocabulary
+            ):
                 last_non_blank = features_len - 1
                 for t in range(features_len - 1, token_boundaries[-1][0], -1):
                     if int(best_tokens[t]) != len(self.vocabulary):
