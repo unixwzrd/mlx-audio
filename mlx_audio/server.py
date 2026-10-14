@@ -54,6 +54,7 @@ from mlx_audio.realtime_vad import (
     parse_turn_detection,
 )
 from mlx_audio.reference_registry import (
+    MAX_AUDIO_BYTES,
     ReferenceError,
     ReferenceRegistry,
     ResolvedReference,
@@ -112,8 +113,6 @@ class ModelProvider:
             self.models[model_name] = load_model(model_name)
             model = self.models[model_name]
             setattr(model, "_mlx_audio_model_revision", model_name)
-            if hasattr(model, "_model_revision"):
-                model._model_revision = model_name
 
         return self.models[model_name]
 
@@ -253,6 +252,7 @@ class SpeechTaskPayload:
     ref_text: str | None = None
     reference_id: str = ""
     pair_sha256: str = ""
+    lang_code: str | None = None
 
 
 @dataclass
@@ -395,7 +395,29 @@ def _require_reference_admin(request: Request) -> None:
 
 
 def _looks_like_reference_path(value: str) -> bool:
-    return value.startswith(("/", "~", ".")) or os.path.sep in value
+    return value.startswith(("/", "~/", "./", "../"))
+
+
+def _callable_language_default(function: Any) -> str | None:
+    try:
+        parameter = inspect.signature(function).parameters.get("lang_code")
+    except (TypeError, ValueError):
+        return None
+    if parameter is None or parameter.default in {inspect.Parameter.empty, None}:
+        return None
+    return str(parameter.default)
+
+
+def _resolve_language(payload: SpeechRequest, model: Any) -> str | None:
+    if payload.lang_code is not None:
+        return payload.lang_code
+    for name in ("generate", "batch_generate"):
+        function = getattr(model, name, None)
+        if callable(function):
+            default = _callable_language_default(function)
+            if default is not None:
+                return default
+    return None
 
 
 def _resolve_speech_reference(
@@ -406,6 +428,7 @@ def _resolve_speech_reference(
     """Normalize exactly one reference mode into an inseparable model pair."""
 
     caps = _model_capabilities(payload.model, model)
+    lang_code = _resolve_language(payload, model)
     legacy = payload.ref_audio is not None or payload.ref_text is not None
     modes = (
         int(legacy)
@@ -513,6 +536,7 @@ def _resolve_speech_reference(
             ref_text=transcript,
             reference_id=resolved.reference_id,
             pair_sha256=resolved.pair_sha256,
+            lang_code=lang_code,
         )
 
     if payload.exaggeration is not None:
@@ -528,7 +552,7 @@ def _resolve_speech_reference(
         raise HTTPException(
             status_code=422, detail="model does not support instruction"
         )
-    return SpeechTaskPayload(request=payload)
+    return SpeechTaskPayload(request=payload, lang_code=lang_code)
 
 
 _STT_EXTRA_KWARGS = {"word_timestamps", "timestamp_granularities"}
@@ -724,26 +748,38 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         return model
 
     def _build_batch_options(self, request: InferenceRequest) -> TTSBatchOptions:
+        payload: SpeechTaskPayload = request.payload
         speech_request: SpeechRequest = request.payload.request
-        return TTSBatchOptions(
-            temperature=speech_request.temperature,
-            top_p=speech_request.top_p,
-            top_k=speech_request.top_k,
-            repetition_penalty=speech_request.repetition_penalty,
-            max_tokens=speech_request.max_tokens,
-            lang_code=speech_request.lang_code,
-            stream=speech_request.stream,
-            streaming_interval=speech_request.streaming_interval,
-            max_batch_size=self.max_batch_size,
-            verbose=speech_request.verbose,
-        )
+        options = {
+            "temperature": speech_request.temperature,
+            "top_p": speech_request.top_p,
+            "top_k": speech_request.top_k,
+            "repetition_penalty": speech_request.repetition_penalty,
+            "max_tokens": speech_request.max_tokens,
+            "stream": speech_request.stream,
+            "streaming_interval": speech_request.streaming_interval,
+            "max_batch_size": self.max_batch_size,
+            "verbose": speech_request.verbose,
+        }
+        if payload.lang_code is not None:
+            options["lang_code"] = payload.lang_code
+        return TTSBatchOptions(**options)
 
     def _request_kwargs(self, request: InferenceRequest) -> dict[str, Any]:
         payload: SpeechTaskPayload = request.payload
         values = payload.request.model_dump(
-            exclude={"model", "reference", "reference_id", "ref_audio", "ref_text"},
+            exclude={
+                "model",
+                "reference",
+                "reference_id",
+                "ref_audio",
+                "ref_text",
+                "lang_code",
+            },
             exclude_none=True,
         )
+        if payload.lang_code is not None:
+            values["lang_code"] = payload.lang_code
         if payload.ref_audio is not None:
             values["ref_audio"] = payload.ref_audio
         if payload.ref_text is not None:
@@ -844,7 +880,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         return (
             "tts",
             speech_request.stream,
-            speech_request.lang_code,
+            payload.lang_code,
             speech_request.temperature,
             speech_request.top_p,
             speech_request.top_k,
@@ -918,7 +954,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "gender": speech_request.gender,
             "pitch": speech_request.pitch,
             "instruct": speech_request.instruct,
-            "lang_code": speech_request.lang_code,
+            "lang_code": payload.lang_code,
             "ref_audio": ref_audio,
             "ref_text": payload.ref_text,
             "temperature": speech_request.temperature,
@@ -991,8 +1027,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         speeds = [request.payload.request.speed for request in requests]
         genders = [request.payload.request.gender for request in requests]
         pitches = [request.payload.request.pitch for request in requests]
-        ref_audios = [request.payload.ref_audio for request in requests]
-        ref_texts = [request.payload.ref_text for request in requests]
+        ref_audios, ref_texts = self._coalesce_batch_references(requests)
 
         batch_generate = self._get_callable_model_attr(model, "batch_generate")
         if batch_generate is None:
@@ -1011,7 +1046,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "ref_audios": ref_audios,
             "ref_texts": ref_texts,
             "temperature": first_speech_request.temperature,
-            "lang_code": first_speech_request.lang_code,
+            "lang_code": requests[0].payload.lang_code,
             "max_tokens": first_speech_request.max_tokens,
             "top_k": first_speech_request.top_k,
             "top_p": first_speech_request.top_p,
@@ -1020,7 +1055,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "verbose": first_speech_request.verbose,
         }
         kwargs = {
-            key: value for key, value in kwargs.items() if key in signature.parameters
+            key: value
+            for key, value in kwargs.items()
+            if value is not None and key in signature.parameters
         }
 
         audio_chunks_by_sequence: list[list[Any]] = [[] for _ in requests]
@@ -1058,6 +1095,30 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
                 sample_rate,
             )
             request.emit_done()
+
+    @staticmethod
+    def _coalesce_batch_references(
+        requests: list[InferenceRequest],
+    ) -> tuple[list[Any], list[str | None]]:
+        payloads: list[SpeechTaskPayload] = [request.payload for request in requests]
+        if not any(
+            payload.ref_audio is not None or payload.ref_text is not None
+            for payload in payloads
+        ):
+            return [None] * len(payloads), [None] * len(payloads)
+
+        digests = {payload.pair_sha256 for payload in payloads}
+        if "" in digests or len(digests) != 1:
+            raise ValueError(
+                "batched reference cloning requires one verified shared pair"
+            )
+        first = payloads[0]
+        if first.ref_audio is None or first.ref_text is None:
+            raise ValueError("batched reference cloning requires audio and transcript")
+        return (
+            [first.ref_audio] * len(payloads),
+            [first.ref_text] * len(payloads),
+        )
 
 
 class SeparationExecutionAdapter(BaseModelExecutionAdapter):
@@ -1271,8 +1332,8 @@ async def create_audio_reference(
                 detail="model does not have a known reference cloning contract",
             )
         transcript_required = model_capabilities["transcript_required"]
-    data = await audio.read()
     try:
+        data = await audio.read(MAX_AUDIO_BYTES + 1)
         record = _reference_registry().register(
             audio=data,
             filename=audio.filename or "reference.wav",
@@ -1286,6 +1347,8 @@ async def create_audio_reference(
         )
     except ReferenceError as exc:
         raise _reference_http_error(exc) from exc
+    finally:
+        await audio.close()
     return record
 
 

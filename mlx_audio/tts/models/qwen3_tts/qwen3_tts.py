@@ -236,22 +236,46 @@ class Model(nn.Module):
         return "qwen3_tts"
 
     def _icl_cache_key(self, ref_audio: mx.array, ref_text: str) -> tuple[str, str]:
+        ref_audio = mx.array(ref_audio, dtype=mx.float32)
+        audio = np.asarray(ref_audio)
+        revision = str(
+            getattr(self, "_model_revision", "")
+            or getattr(self, "_mlx_audio_model_revision", "")
+            or getattr(getattr(self, "config", None), "_commit_hash", "")
+            or getattr(getattr(self, "config", None), "name_or_path", "")
+            or "qwen3_tts"
+        )
         pair_hash = hashlib.sha256()
-        pair_hash.update(np.asarray(ref_audio).tobytes(order="C"))
-        pair_hash.update(b"\0")
-        pair_hash.update(ref_text.encode("utf-8"))
-        return self._model_revision, pair_hash.hexdigest()
+        for component in (
+            revision.encode("utf-8"),
+            str(audio.dtype).encode("ascii"),
+            json.dumps(audio.shape).encode("ascii"),
+            audio.tobytes(order="C"),
+            ref_text.encode("utf-8"),
+        ):
+            pair_hash.update(len(component).to_bytes(8, "big"))
+            pair_hash.update(component)
+        return revision, pair_hash.hexdigest()
 
     def _get_icl_cache(self, cache_key):
-        cached = self._icl_cache.pop(cache_key, None)
+        cache = getattr(self, "_icl_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict(cache or {})
+            self._icl_cache = cache
+        cached = cache.pop(cache_key, None)
         if cached is not None:
-            self._icl_cache[cache_key] = cached
+            cache[cache_key] = cached
         return cached
 
     def _put_icl_cache(self, cache_key, value) -> None:
-        self._icl_cache[cache_key] = value
-        while len(self._icl_cache) > self._icl_cache_max_entries:
-            self._icl_cache.popitem(last=False)
+        cache = getattr(self, "_icl_cache", None)
+        if not isinstance(cache, OrderedDict):
+            cache = OrderedDict(cache or {})
+            self._icl_cache = cache
+        cache[cache_key] = value
+        max_entries = max(1, int(getattr(self, "_icl_cache_max_entries", 32)))
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
 
     def supports_tts_batch(
         self,
@@ -675,6 +699,7 @@ class Model(nn.Module):
 
         config = self.config.talker_config
 
+        ref_audio = mx.array(ref_audio, dtype=mx.float32)
         ref_codes = None
         ref_text_ids = None
         cache_key = self._icl_cache_key(ref_audio, ref_text)

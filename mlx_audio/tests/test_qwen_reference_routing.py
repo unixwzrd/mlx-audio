@@ -67,6 +67,22 @@ def test_icl_cache_identity_includes_revision_audio_and_exact_text():
     assert first != model._icl_cache_key(audio, "words")
 
 
+def test_icl_cache_key_handles_partial_model_and_normalizes_audio_dtype():
+    model = Model.__new__(Model)
+    float_audio = mx.array([0.0, 1.0, -1.0], dtype=mx.float32)
+    integer_audio = mx.array([0, 1, -1], dtype=mx.int16)
+    bfloat_audio = mx.array([0.0, 1.0, -1.0], dtype=mx.bfloat16)
+
+    float_key = model._icl_cache_key(float_audio, "words")
+    assert float_key[0] == "qwen3_tts"
+    assert float_key == model._icl_cache_key(integer_audio, "words")
+    assert float_key == model._icl_cache_key(bfloat_audio, "words")
+    assert float_key != model._icl_cache_key(mx.reshape(float_audio, (1, 3)), "words")
+
+    model.config = SimpleNamespace(_commit_hash="commit-cafebabe")
+    assert model._icl_cache_key(float_audio, "words")[0] == "commit-cafebabe"
+
+
 def test_icl_cache_is_lru_bounded():
     model = Model.__new__(Model)
     model._icl_cache = OrderedDict()

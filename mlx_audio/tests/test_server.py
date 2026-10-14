@@ -21,17 +21,24 @@ from mlx_audio.audio_io import write as audio_write
 # python-multipart is required for FastAPI file uploads
 pytest.importorskip("multipart", reason="python-multipart is required for server tests")
 
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
+from mlx_audio.reference_registry import MAX_AUDIO_BYTES
 from mlx_audio.server import (
+    ModelProvider,
     SpeechRequest,
     SpeechTaskPayload,
     TTSExecutionAdapter,
+    _resolve_speech_reference,
     _stream_inference_results,
     _TTSAdapterContinuousSession,
     app,
+    create_audio_reference,
 )
 from mlx_audio.server_inference import InferenceRequest, InferenceResultChunk
+from mlx_audio.tts.models.kokoro.kokoro import Model as KokoroModel
+from mlx_audio.tts.models.qwen3_tts.qwen3_tts import Model
 
 
 @pytest.fixture
@@ -365,6 +372,156 @@ def test_normalized_reference_reaches_batch_and_continuous_payloads():
     item = model_session.add.call_args.args[0][0]
     assert item.ref_audio is ref_audio
     assert item.ref_text == "Exact transcript."
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    ["and/or remains spoken text", "https://example.test is spoken text"],
+)
+def test_literal_transcript_with_slash_is_not_treated_as_path(
+    client, mock_model_provider, monkeypatch, tmp_path, transcript
+):
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    sample = allowed_root / "voice.wav"
+    sample.write_bytes(_reference_wav_bytes())
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_ROOTS", str(allowed_root))
+    model = _qwen_mock_model()
+    mock_model_provider.load_model = MagicMock(return_value=model)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "Qwen3-TTS-Base",
+            "input": "Target",
+            "ref_audio": str(sample),
+            "ref_text": transcript,
+            "response_format": "wav",
+        },
+    )
+
+    assert response.status_code == 200
+    assert model.generate.call_args.kwargs["ref_text"] == transcript
+
+
+@pytest.mark.parametrize(
+    ("default", "explicit", "expected"),
+    [("auto", None, "auto"), ("a", None, "a"), ("auto", "english", "english")],
+)
+def test_language_resolves_from_model_signature(default, explicit, expected):
+    namespace = {}
+    exec(
+        f"def generate(text, lang_code={default!r}):\n    return iter(())",
+        namespace,
+    )
+    model = SimpleNamespace(generate=namespace["generate"])
+    payload = SpeechRequest(model="model", input="Target", lang_code=explicit)
+
+    resolved = _resolve_speech_reference(payload, model=model)
+
+    assert resolved.lang_code == expected
+
+
+@pytest.mark.parametrize(
+    ("generate", "expected"),
+    [(Model.generate, "auto"), (KokoroModel.generate, "a")],
+)
+def test_language_uses_real_model_signature_defaults(generate, expected):
+    model = SimpleNamespace(generate=generate)
+    payload = SpeechRequest(model="model", input="Target")
+
+    assert _resolve_speech_reference(payload, model=model).lang_code == expected
+
+
+def test_resolved_language_is_shared_by_serial_batch_and_continuous_options():
+    payload = SpeechTaskPayload(
+        request=SpeechRequest(model="qwen", input="Target"),
+        lang_code="auto",
+    )
+    request = InferenceRequest(endpoint_kind="tts", model_name="qwen", payload=payload)
+    adapter = TTSExecutionAdapter()
+
+    assert adapter._request_kwargs(request)["lang_code"] == "auto"
+    assert adapter._build_batch_options(request).lang_code == "auto"
+    assert adapter.batch_key(request)[2] == "auto"
+
+
+def test_model_provider_preserves_config_revision():
+    model = SimpleNamespace(_model_revision="commit-deadbeef")
+    provider = ModelProvider()
+
+    with patch("mlx_audio.server.load_model", return_value=model):
+        assert provider.load_model("org/model") is model
+
+    assert model._model_revision == "commit-deadbeef"
+    assert model._mlx_audio_model_revision == "org/model"
+
+
+@pytest.mark.asyncio
+async def test_reference_upload_is_bounded_and_closed(monkeypatch):
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_ADMIN_TOKEN", "secret")
+    upload = AsyncMock()
+    upload.filename = "large.wav"
+    upload.read.return_value = b"x" * (MAX_AUDIO_BYTES + 1)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/audio/references",
+            "headers": [(b"authorization", b"Bearer secret")],
+        }
+    )
+
+    with pytest.raises(HTTPException, match="exceeds 20 MiB"):
+        await create_audio_reference(
+            request=request,
+            audio=upload,
+            transcript="words",
+            name="large",
+            model=None,
+        )
+
+    upload.read.assert_awaited_once_with(MAX_AUDIO_BYTES + 1)
+    upload.close.assert_awaited_once()
+
+
+def test_batch_reuses_verified_pair_for_real_qwen_reference_prepare(tmp_path):
+    first_audio = mx.array([0.0, 0.25, -0.25])
+    audio_path = tmp_path / "voice.wav"
+    audio_path.write_bytes(b"representation is not read after coalescing")
+    digest = "a" * 64
+
+    def make_request(audio, pair_sha256=digest):
+        return InferenceRequest(
+            endpoint_kind="tts",
+            model_name="qwen",
+            payload=SpeechTaskPayload(
+                request=SpeechRequest(model="qwen", input="Target"),
+                ref_audio=audio,
+                ref_text="Exact transcript.",
+                pair_sha256=pair_sha256,
+            ),
+        )
+
+    requests = [make_request(first_audio), make_request(str(audio_path))]
+    ref_audios, ref_texts = TTSExecutionAdapter._coalesce_batch_references(requests)
+    assert ref_audios[0] is ref_audios[1] is first_audio
+
+    model = Model.__new__(Model)
+    model._sample_rate = 24000
+    prepared_audio, prepared_text = Model._normalize_shared_batch_refs(
+        model,
+        2,
+        ref_audios=ref_audios,
+        ref_texts=ref_texts,
+    )
+    assert prepared_audio is first_audio
+    assert prepared_text == "Exact transcript."
+
+    with pytest.raises(ValueError, match="one verified shared pair"):
+        TTSExecutionAdapter._coalesce_batch_references(
+            [requests[0], make_request(str(audio_path), pair_sha256="b" * 64)]
+        )
 
 
 def test_tts_speech(client, mock_model_provider):
