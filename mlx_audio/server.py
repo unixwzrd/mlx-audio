@@ -8,6 +8,7 @@ It offers an OpenAI-compatible API for Audio completions and model management.
 import argparse
 import asyncio
 import base64
+import hmac
 import inspect
 import io
 import json
@@ -52,6 +53,16 @@ from mlx_audio.realtime_vad import (
     TurnEventKind,
     parse_turn_detection,
 )
+from mlx_audio.reference_registry import (
+    ReferenceError,
+    ReferenceRegistry,
+    ResolvedReference,
+    configured_reference_roots,
+    pair_digest,
+    resolve_allowed_file,
+    validate_audio,
+    validate_transcript,
+)
 from mlx_audio.server_inference import (
     BaseModelExecutionAdapter,
     InferenceBroker,
@@ -62,6 +73,7 @@ from mlx_audio.server_inference import (
 from mlx_audio.stt.streaming import StreamingSession
 from mlx_audio.tts.continuous import TTSBatchItem, TTSBatchOptions
 from mlx_audio.utils import load_model
+from mlx_audio.version import __version__
 
 
 def sanitize_for_json(obj: Any) -> Any:
@@ -98,6 +110,10 @@ class ModelProvider:
     def load_model(self, model_name: str):
         if model_name not in self.models:
             self.models[model_name] = load_model(model_name)
+            model = self.models[model_name]
+            setattr(model, "_mlx_audio_model_revision", model_name)
+            if hasattr(model, "_model_revision"):
+                model._model_revision = model_name
 
         return self.models[model_name]
 
@@ -165,6 +181,16 @@ app.router.lifespan_context = app_lifespan
 
 
 # Request schemas for OpenAI-compatible endpoints
+class InlineReference(BaseModel):
+    audio_base64: str
+    transcript: str | None = None
+    filename: str = "reference.wav"
+
+
+class ReferenceRename(BaseModel):
+    name: str
+
+
 class SpeechRequest(BaseModel):
     model: str
     input: str
@@ -173,9 +199,15 @@ class SpeechRequest(BaseModel):
     speed: float | None = 1.0
     gender: str | None = "male"
     pitch: float | None = 1.0
-    lang_code: str | None = "a"
+    # Let each model use its own language default (for example, Kokoro uses
+    # ``a`` while multilingual Chatterbox uses ``en``). Clients may still set
+    # an explicit model-native language code.
+    lang_code: str | None = None
     ref_audio: str | None = None
     ref_text: str | None = None
+    reference_id: str | None = None
+    reference: InlineReference | None = None
+    exaggeration: float | None = None
     temperature: float | None = 0.7
     top_p: float | None = 0.95
     top_k: int | None = 40
@@ -217,6 +249,10 @@ INFERENCE_BROKER: Optional[InferenceBroker] = None
 @dataclass
 class SpeechTaskPayload:
     request: SpeechRequest
+    ref_audio: Any = None
+    ref_text: str | None = None
+    reference_id: str = ""
+    pair_sha256: str = ""
 
 
 @dataclass
@@ -274,6 +310,225 @@ async def _preflight_model_load(model_name: str) -> None:
             status_code=500,
             detail=f"Failed to load model {model_name!r}: {exc}",
         ) from exc
+
+
+def _reference_registry() -> ReferenceRegistry:
+    return ReferenceRegistry()
+
+
+def _model_capabilities(model_name: str, model: Any | None = None) -> dict[str, Any]:
+    """Describe the request contract without exposing local model paths."""
+
+    lowered = model_name.casefold()
+    config = getattr(model, "config", None)
+    qwen_kind = getattr(config, "tts_model_type", "")
+    family = "unknown"
+    clone_mode = "none"
+    transcript_required = False
+    named_voice = bool(getattr(model, "supported_speakers", []))
+    style_controls: list[str] = []
+
+    if "qwen3" in lowered or qwen_kind:
+        family = "qwen3_tts"
+        if qwen_kind == "voice_design" or "voicedesign" in lowered:
+            style_controls = ["instruct"]
+        elif qwen_kind == "custom_voice" or "customvoice" in lowered:
+            clone_mode = "audio_transcript"
+            transcript_required = True
+            named_voice = True
+            style_controls = ["instruct"]
+        else:
+            clone_mode = "audio_transcript"
+            transcript_required = True
+    elif "chatterbox" in lowered:
+        family = "chatterbox"
+        clone_mode = "audio"
+        style_controls = ["exaggeration"]
+    elif "arktts" in lowered or "audio8" in lowered:
+        family = "arktts"
+        clone_mode = "audio_transcript"
+        transcript_required = True
+    elif "confucius" in lowered:
+        family = "confucius"
+        clone_mode = "audio"
+    elif "zonos" in lowered:
+        family = "zonos2"
+        clone_mode = "audio"
+
+    return {
+        "revision": __version__,
+        "model": model_name,
+        "family": family,
+        "clone_mode": clone_mode,
+        "transcript_required": transcript_required,
+        "streaming": True,
+        "batching": bool(
+            model is not None
+            and (
+                callable(getattr(model, "batch_generate", None))
+                or callable(getattr(model, "create_tts_batch_session", None))
+            )
+        ),
+        "named_voice": named_voice,
+        "style_controls": style_controls,
+    }
+
+
+def _reference_http_error(exc: ReferenceError) -> HTTPException:
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _require_reference_admin(request: Request) -> None:
+    expected = os.getenv("MLX_AUDIO_REFERENCE_ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(
+            status_code=503, detail="reference administration is disabled"
+        )
+    authorization = request.headers.get("authorization", "")
+    supplied = (
+        authorization[7:]
+        if authorization.casefold().startswith("bearer ")
+        else request.headers.get("x-mlx-audio-admin-token", "")
+    )
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _looks_like_reference_path(value: str) -> bool:
+    return value.startswith(("/", "~", ".")) or os.path.sep in value
+
+
+def _resolve_speech_reference(
+    payload: SpeechRequest,
+    *,
+    model: Any,
+) -> SpeechTaskPayload:
+    """Normalize exactly one reference mode into an inseparable model pair."""
+
+    caps = _model_capabilities(payload.model, model)
+    legacy = payload.ref_audio is not None or payload.ref_text is not None
+    modes = (
+        int(legacy)
+        + int(payload.reference_id is not None)
+        + int(payload.reference is not None)
+    )
+    if modes > 1:
+        raise HTTPException(
+            status_code=422, detail="reference inputs are mutually exclusive"
+        )
+    if modes and payload.voice:
+        raise HTTPException(
+            status_code=422,
+            detail="voice and clone references are mutually exclusive",
+        )
+    if payload.ref_text is not None and payload.ref_audio is None:
+        raise HTTPException(
+            status_code=422, detail="reference text requires reference audio"
+        )
+
+    resolved: ResolvedReference | None = None
+    try:
+        if payload.reference_id is not None:
+            resolved = _reference_registry().resolve(payload.reference_id)
+        elif payload.reference is not None:
+            reference = payload.reference
+            try:
+                audio_bytes = base64.b64decode(reference.audio_base64, validate=True)
+            except Exception as exc:  # noqa: BLE001
+                raise ReferenceError(
+                    "inline reference audio is not valid base64"
+                ) from exc
+            validate_audio(audio_bytes, reference.filename)
+            transcript = validate_transcript(
+                reference.transcript,
+                required=caps["transcript_required"],
+            )
+            audio_sha, digest = pair_digest(audio_bytes, transcript)
+            del audio_sha
+            samples, _ = audio_read(
+                io.BytesIO(audio_bytes),
+                dtype="float32",
+                sample_rate=model.sample_rate,
+                nchannels=1,
+            )
+            resolved = ResolvedReference(
+                audio=mx.array(samples),
+                transcript=transcript,
+                reference_id=f"inline_{digest[:16]}",
+                pair_sha256=digest,
+            )
+        elif legacy:
+            assert payload.ref_audio is not None
+            audio_path = resolve_allowed_file(
+                payload.ref_audio,
+                configured_reference_roots(),
+            )
+            transcript = payload.ref_text
+            if transcript is not None and _looks_like_reference_path(transcript):
+                transcript_path = resolve_allowed_file(
+                    transcript,
+                    configured_reference_roots(),
+                )
+                transcript = transcript_path.read_text(encoding="utf-8")
+            transcript = validate_transcript(
+                transcript,
+                required=caps["transcript_required"],
+            )
+            audio_bytes = audio_path.read_bytes()
+            validate_audio(audio_bytes, audio_path.name)
+            _, digest = pair_digest(audio_bytes, transcript)
+            resolved = ResolvedReference(
+                audio=str(audio_path),
+                transcript=transcript,
+                reference_id="legacy",
+                pair_sha256=digest,
+            )
+    except (OSError, UnicodeError, ReferenceError) as exc:
+        if isinstance(exc, ReferenceError):
+            raise _reference_http_error(exc) from exc
+        raise HTTPException(
+            status_code=422, detail="reference file is unreadable"
+        ) from exc
+
+    if resolved is not None and caps["clone_mode"] == "none":
+        raise HTTPException(
+            status_code=422, detail="loaded model does not support cloning"
+        )
+    if resolved is not None:
+        try:
+            transcript = validate_transcript(
+                resolved.transcript,
+                required=caps["transcript_required"],
+            )
+        except ReferenceError as exc:
+            raise _reference_http_error(exc) from exc
+        if payload.instruct and caps["family"] == "qwen3_tts":
+            raise HTTPException(
+                status_code=422,
+                detail="instruction controls are unsupported with Qwen reference cloning",
+            )
+        return SpeechTaskPayload(
+            request=payload,
+            ref_audio=resolved.audio,
+            ref_text=transcript,
+            reference_id=resolved.reference_id,
+            pair_sha256=resolved.pair_sha256,
+        )
+
+    if payload.exaggeration is not None:
+        if "exaggeration" not in caps["style_controls"]:
+            raise HTTPException(
+                status_code=422, detail="model does not support exaggeration"
+            )
+        if not 0.0 <= payload.exaggeration <= 1.0:
+            raise HTTPException(
+                status_code=422, detail="exaggeration must be between 0 and 1"
+            )
+    if payload.instruct and "instruct" not in caps["style_controls"]:
+        raise HTTPException(
+            status_code=422, detail="model does not support instruction"
+        )
+    return SpeechTaskPayload(request=payload)
 
 
 _STT_EXTRA_KWARGS = {"word_timestamps", "timestamp_granularities"}
@@ -386,8 +641,8 @@ class _TTSAdapterContinuousSession:
                     speed=speech_request.speed,
                     gender=speech_request.gender,
                     pitch=speech_request.pitch,
-                    ref_audio=speech_request.ref_audio,
-                    ref_text=speech_request.ref_text,
+                    ref_audio=payload.ref_audio,
+                    ref_text=payload.ref_text,
                 )
             ]
         )
@@ -484,8 +739,16 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         )
 
     def _request_kwargs(self, request: InferenceRequest) -> dict[str, Any]:
-        speech_request: SpeechRequest = request.payload.request
-        return speech_request.model_dump(exclude={"model"}, exclude_none=True)
+        payload: SpeechTaskPayload = request.payload
+        values = payload.request.model_dump(
+            exclude={"model", "reference", "reference_id", "ref_audio", "ref_text"},
+            exclude_none=True,
+        )
+        if payload.ref_audio is not None:
+            values["ref_audio"] = payload.ref_audio
+        if payload.ref_text is not None:
+            values["ref_text"] = payload.ref_text
+        return values
 
     def _get_callable_model_attr(self, model, name: str):
         value = getattr(model, name, None)
@@ -515,7 +778,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
 
         if speech_request.stream:
             return False
-        if speech_request.ref_audio or speech_request.ref_text:
+        payload: SpeechTaskPayload = request.payload
+        if payload.ref_audio is not None or payload.ref_text is not None:
             return False
         if speech_request.gender not in (None, "male"):
             return False
@@ -550,9 +814,10 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             return False
         if speech_request.pitch not in (None, 1.0) and "pitches" not in params:
             return False
-        if speech_request.ref_audio and "ref_audios" not in params:
+        payload: SpeechTaskPayload = request.payload
+        if payload.ref_audio is not None and "ref_audios" not in params:
             return False
-        if speech_request.ref_text and "ref_texts" not in params:
+        if payload.ref_text is not None and "ref_texts" not in params:
             return False
         return True
 
@@ -574,6 +839,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         return self._can_call_continuous_session(model, request)
 
     def batch_key(self, request: InferenceRequest) -> Any:
+        payload: SpeechTaskPayload = request.payload
         speech_request: SpeechRequest = request.payload.request
         return (
             "tts",
@@ -584,8 +850,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             speech_request.top_k,
             speech_request.repetition_penalty,
             speech_request.max_tokens,
-            speech_request.ref_audio,
-            speech_request.ref_text,
+            payload.pair_sha256,
             speech_request.streaming_interval if speech_request.stream else None,
             speech_request.verbose,
         )
@@ -628,8 +893,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         speech_request = payload.request
         model = self._get_model_for_request(request)
 
-        ref_audio = speech_request.ref_audio
-        if ref_audio and isinstance(ref_audio, str):
+        ref_audio = payload.ref_audio
+        if isinstance(ref_audio, str):
             if not os.path.exists(ref_audio):
                 raise HTTPException(
                     status_code=400,
@@ -655,7 +920,7 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "instruct": speech_request.instruct,
             "lang_code": speech_request.lang_code,
             "ref_audio": ref_audio,
-            "ref_text": speech_request.ref_text,
+            "ref_text": payload.ref_text,
             "temperature": speech_request.temperature,
             "top_p": speech_request.top_p,
             "top_k": speech_request.top_k,
@@ -664,6 +929,17 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "streaming_interval": speech_request.streaming_interval,
             "max_tokens": speech_request.max_tokens,
             "verbose": speech_request.verbose,
+            "exaggeration": speech_request.exaggeration,
+        }
+        signature = inspect.signature(model.generate)
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        generate_kwargs = {
+            key: value
+            for key, value in generate_kwargs.items()
+            if value is not None and (key in signature.parameters or accepts_kwargs)
         }
 
         for result in model.generate(speech_request.input, **generate_kwargs):
@@ -715,8 +991,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
         speeds = [request.payload.request.speed for request in requests]
         genders = [request.payload.request.gender for request in requests]
         pitches = [request.payload.request.pitch for request in requests]
-        ref_audios = [request.payload.request.ref_audio for request in requests]
-        ref_texts = [request.payload.request.ref_text for request in requests]
+        ref_audios = [request.payload.ref_audio for request in requests]
+        ref_texts = [request.payload.ref_text for request in requests]
 
         batch_generate = self._get_callable_model_attr(model, "batch_generate")
         if batch_generate is None:
@@ -971,23 +1247,132 @@ async def remove_model(model_name: str):
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
 
+@app.post("/v1/audio/references", status_code=201)
+async def create_audio_reference(
+    request: Request,
+    audio: UploadFile = File(...),
+    transcript: str | None = Form(None),
+    name: str = Form(...),
+    model: str | None = Form(None),
+    language: str = Form(""),
+    emotion: str = Form(""),
+    intensity: float | None = Form(None),
+    instruction: str = Form(""),
+):
+    """Atomically register an immutable audio/transcript reference pair."""
+
+    _require_reference_admin(request)
+    transcript_required = True
+    if model:
+        model_capabilities = _model_capabilities(model)
+        if model_capabilities["clone_mode"] == "none":
+            raise HTTPException(
+                status_code=422,
+                detail="model does not have a known reference cloning contract",
+            )
+        transcript_required = model_capabilities["transcript_required"]
+    data = await audio.read()
+    try:
+        record = _reference_registry().register(
+            audio=data,
+            filename=audio.filename or "reference.wav",
+            transcript=transcript,
+            name=name,
+            language=language,
+            emotion=emotion,
+            intensity=intensity,
+            instruction=instruction,
+            transcript_required=transcript_required,
+        )
+    except ReferenceError as exc:
+        raise _reference_http_error(exc) from exc
+    return record
+
+
+@app.get("/v1/audio/references")
+async def list_audio_references():
+    return {"object": "list", "data": _reference_registry().list()}
+
+
+@app.get("/v1/audio/references/{reference_id}")
+async def get_audio_reference(reference_id: str):
+    try:
+        return _reference_registry().get(reference_id)
+    except ReferenceError as exc:
+        status = 404 if "not found" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@app.patch("/v1/audio/references/{reference_id}")
+async def rename_audio_reference(
+    reference_id: str, update: ReferenceRename, request: Request
+):
+    """Rename safe metadata without changing the immutable pair or its ID."""
+
+    _require_reference_admin(request)
+    try:
+        return _reference_registry().rename(reference_id, update.name)
+    except ReferenceError as exc:
+        status = 404 if "not found" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+
+@app.delete("/v1/audio/references/{reference_id}", status_code=204)
+async def delete_audio_reference(reference_id: str, request: Request):
+    _require_reference_admin(request)
+    try:
+        _reference_registry().delete(reference_id)
+    except ReferenceError as exc:
+        status = 404 if "not found" in str(exc) else 422
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    return Response(status_code=204)
+
+
+@app.get("/v1/audio/capabilities")
+async def tts_capabilities(model: str | None = None):
+    if model:
+        await _preflight_model_load(model)
+        loaded = model_provider.load_model(model)
+        return _model_capabilities(model, loaded)
+    names = await model_provider.get_available_models()
+    return {
+        "revision": __version__,
+        "object": "list",
+        "data": [
+            _model_capabilities(name, model_provider.models[name]) for name in names
+        ],
+    }
+
+
 @app.post("/v1/audio/speech")
 async def tts_speech(payload: SpeechRequest, request: Request):
     """Generate speech audio following the OpenAI text-to-speech API."""
-    if payload.ref_audio and isinstance(payload.ref_audio, str):
-        if not os.path.exists(payload.ref_audio):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Reference audio file not found: {payload.ref_audio}",
-            )
 
     await _preflight_model_load(payload.model)
+    task_payload = _resolve_speech_reference(
+        payload,
+        model=model_provider.load_model(payload.model),
+    )
+    normalized_kwargs = payload.model_dump(
+        exclude={
+            "model",
+            "input",
+            "reference",
+            "reference_id",
+            "ref_audio",
+            "ref_text",
+        },
+        exclude_none=True,
+    )
+    if task_payload.reference_id:
+        normalized_kwargs["reference_id"] = task_payload.reference_id
+        normalized_kwargs["pair_sha256_prefix"] = task_payload.pair_sha256[:12]
 
     handle = get_inference_broker().submit(
         endpoint_kind="tts",
         model_name=payload.model,
-        payload=SpeechTaskPayload(request=payload),
-        normalized_kwargs=payload.model_dump(exclude={"model"}, exclude_none=True),
+        payload=task_payload,
+        normalized_kwargs=normalized_kwargs,
         stream=payload.stream,
     )
     return StreamingResponse(

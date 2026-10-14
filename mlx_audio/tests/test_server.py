@@ -1,8 +1,12 @@
+import base64
 import functools
 import inspect
 import io
 import json
 import queue
+import struct
+import wave
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
@@ -19,8 +23,15 @@ pytest.importorskip("multipart", reason="python-multipart is required for server
 
 from fastapi.testclient import TestClient
 
-from mlx_audio.server import _stream_inference_results, app
-from mlx_audio.server_inference import InferenceResultChunk
+from mlx_audio.server import (
+    SpeechRequest,
+    SpeechTaskPayload,
+    TTSExecutionAdapter,
+    _stream_inference_results,
+    _TTSAdapterContinuousSession,
+    app,
+)
+from mlx_audio.server_inference import InferenceRequest, InferenceResultChunk
 
 
 @pytest.fixture
@@ -109,6 +120,251 @@ def sync_mock_audio_stream_generator(input_text: str, **kwargs):
     t = np.linspace(0, duration, int(sample_rate * duration), False)
     audio_data = 0.5 * np.sin(2 * np.pi * frequency * t)
     yield MockAudioResult(audio_data.astype(np.float32), sample_rate)
+
+
+def _reference_wav_bytes(seconds: float = 1.1, sample_rate: int = 16000) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        output.writeframes(
+            b"".join(
+                struct.pack("<h", 500 if index % 2 else -500)
+                for index in range(int(seconds * sample_rate))
+            )
+        )
+    return buffer.getvalue()
+
+
+def _qwen_mock_model():
+    model = MagicMock()
+    model.config = SimpleNamespace(tts_model_type="base")
+    model.sample_rate = 16000
+    model.supported_speakers = []
+    model.generate = MagicMock(wraps=sync_mock_audio_stream_generator)
+    return model
+
+
+def test_reference_registry_api_requires_admin_and_redacts_pair(
+    client, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_STORE", str(tmp_path / "registry"))
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_ADMIN_TOKEN", "secret")
+    files = {"audio": ("voice.wav", _reference_wav_bytes(), "audio/wav")}
+    data = {"name": "neutral", "transcript": "  Exact words.  "}
+
+    unauthorized = client.post("/v1/audio/references", files=files, data=data)
+    assert unauthorized.status_code == 401
+    created = client.post(
+        "/v1/audio/references",
+        files=files,
+        data=data,
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert created.status_code == 201
+    record = created.json()
+    assert record["id"].startswith("ref_")
+    assert "Exact words" not in str(record)
+    assert "audio_file" not in record
+
+    listed = client.get("/v1/audio/references").json()["data"]
+    assert listed == [record]
+    assert (
+        client.patch(
+            f"/v1/audio/references/{record['id']}", json={"name": "Mia1"}
+        ).status_code
+        == 401
+    )
+    renamed = client.patch(
+        f"/v1/audio/references/{record['id']}",
+        json={"name": "Mia1"},
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["id"] == record["id"]
+    assert renamed.json()["pair_sha256"] == record["pair_sha256"]
+    assert renamed.json()["name"] == "Mia1"
+    assert client.delete(f"/v1/audio/references/{record['id']}").status_code == 401
+    deleted = client.delete(
+        f"/v1/audio/references/{record['id']}",
+        headers={"X-MLX-Audio-Admin-Token": "secret"},
+    )
+    assert deleted.status_code == 204
+
+
+def test_tts_registered_reference_forwards_exact_pair(
+    client, mock_model_provider, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_STORE", str(tmp_path / "registry"))
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_ADMIN_TOKEN", "secret")
+    model = _qwen_mock_model()
+    mock_model_provider.load_model = MagicMock(return_value=model)
+    transcript = "  Exact transcript.\n"
+    created = client.post(
+        "/v1/audio/references",
+        files={"audio": ("voice.wav", _reference_wav_bytes(), "audio/wav")},
+        data={"name": "neutral", "transcript": transcript},
+        headers={"Authorization": "Bearer secret"},
+    ).json()
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "Qwen3-TTS-Base",
+            "input": "Target text",
+            "reference_id": created["id"],
+            "response_format": "wav",
+        },
+    )
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    assert kwargs["ref_text"] == transcript
+    assert isinstance(kwargs["ref_audio"], mx.array)
+    assert "lang_code" not in kwargs
+
+
+def test_tts_inline_reference_forwards_pair(client, mock_model_provider):
+    model = _qwen_mock_model()
+    mock_model_provider.load_model = MagicMock(return_value=model)
+    transcript = "Literal reference transcript."
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "Qwen3-TTS-Base",
+            "input": "Target text",
+            "reference": {
+                "audio_base64": base64.b64encode(_reference_wav_bytes()).decode(),
+                "filename": "voice.wav",
+                "transcript": transcript,
+            },
+            "response_format": "wav",
+        },
+    )
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    assert kwargs["ref_text"] == transcript
+    assert isinstance(kwargs["ref_audio"], mx.array)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ref_text": "orphan"},
+        {"voice": "Ethan", "reference_id": "ref_00000000000000000000000000000000"},
+        {"ref_audio": "https://example.test/voice.wav", "ref_text": "text"},
+        {"reference": {"audio_base64": "bad", "transcript": "text"}},
+        {
+            "reference": {
+                "audio_base64": base64.b64encode(_reference_wav_bytes()).decode(),
+                "filename": "voice.wav",
+            }
+        },
+    ],
+)
+def test_tts_rejects_invalid_reference_contract(client, mock_model_provider, payload):
+    model = _qwen_mock_model()
+    mock_model_provider.load_model = MagicMock(return_value=model)
+    response = client.post(
+        "/v1/audio/speech",
+        json={"model": "Qwen3-TTS-Base", "input": "Target", **payload},
+    )
+    assert response.status_code == 422
+
+
+def test_capabilities_report_clone_and_style_contract(client, mock_model_provider):
+    model = _qwen_mock_model()
+    mock_model_provider.load_model = MagicMock(return_value=model)
+    response = client.get("/v1/audio/capabilities?model=Qwen3-TTS-Base")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["clone_mode"] == "audio_transcript"
+    assert body["transcript_required"] is True
+    assert body["style_controls"] == []
+
+
+def test_all_reference_modes_produce_identical_model_inputs(
+    client, mock_model_provider, monkeypatch, tmp_path
+):
+    registry_root = tmp_path / "registry"
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    audio = _reference_wav_bytes()
+    sample = allowed_root / "voice.wav"
+    transcript_path = allowed_root / "voice.txt"
+    transcript = "  Exact reference transcript.\n"
+    sample.write_bytes(audio)
+    transcript_path.write_text(transcript, encoding="utf-8")
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_STORE", str(registry_root))
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_ADMIN_TOKEN", "secret")
+    monkeypatch.setenv("MLX_AUDIO_REFERENCE_ROOTS", str(allowed_root))
+    model = _qwen_mock_model()
+    mock_model_provider.load_model = MagicMock(return_value=model)
+    reference_id = client.post(
+        "/v1/audio/references",
+        files={"audio": ("voice.wav", audio, "audio/wav")},
+        data={"name": "neutral", "transcript": transcript},
+        headers={"Authorization": "Bearer secret"},
+    ).json()["id"]
+
+    variants = [
+        {"reference_id": reference_id},
+        {
+            "reference": {
+                "audio_base64": base64.b64encode(audio).decode(),
+                "filename": "voice.wav",
+                "transcript": transcript,
+            }
+        },
+        {"ref_audio": str(sample), "ref_text": transcript},
+        {"ref_audio": str(sample), "ref_text": str(transcript_path)},
+    ]
+    normalized = []
+    for variant in variants:
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "Qwen3-TTS-Base",
+                "input": "Target",
+                "response_format": "wav",
+                **variant,
+            },
+        )
+        assert response.status_code == 200
+        _, kwargs = model.generate.call_args
+        normalized.append((np.asarray(kwargs["ref_audio"]), kwargs["ref_text"]))
+
+    first_audio, first_text = normalized[0]
+    for candidate_audio, candidate_text in normalized[1:]:
+        np.testing.assert_array_equal(candidate_audio, first_audio)
+        assert candidate_text == first_text == transcript
+
+
+def test_normalized_reference_reaches_batch_and_continuous_payloads():
+    ref_audio = mx.array([0.0, 0.25, -0.25])
+    payload = SpeechTaskPayload(
+        request=SpeechRequest(model="qwen", input="Target"),
+        ref_audio=ref_audio,
+        ref_text="Exact transcript.",
+        reference_id="ref_0123456789abcdef0123456789abcdef",
+        pair_sha256="a" * 64,
+    )
+    request = InferenceRequest(endpoint_kind="tts", model_name="qwen", payload=payload)
+
+    adapter = TTSExecutionAdapter()
+    assert adapter._request_kwargs(request)["ref_audio"] is ref_audio
+    assert adapter._request_kwargs(request)["ref_text"] == "Exact transcript."
+    assert adapter.batch_key(request)[-3] == "a" * 64
+
+    model_session = MagicMock()
+    session = _TTSAdapterContinuousSession(
+        adapter=adapter,
+        model_session=model_session,
+    )
+    session.submit(request)
+    item = model_session.add.call_args.args[0][0]
+    assert item.ref_audio is ref_audio
+    assert item.ref_text == "Exact transcript."
 
 
 def test_tts_speech(client, mock_model_provider):

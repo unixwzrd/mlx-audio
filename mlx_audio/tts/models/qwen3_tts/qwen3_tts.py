@@ -1,13 +1,18 @@
 # Copyright (c) 2025, Prince Canuma and contributors (https://github.com/Blaizzy/mlx-audio)
 
+import hashlib
 import json
+import logging
+import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from tqdm import tqdm
 
 from mlx_audio.dsp import mel_filters, stft
@@ -30,6 +35,13 @@ from .config import (
 from .speaker_encoder import Qwen3TTSSpeakerEncoder
 from .speech_tokenizer import Qwen3TTSSpeechTokenizer
 from .talker import Qwen3TTSTalkerForConditionalGeneration
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_info(message: str, *args: object) -> None:
+    logger.info(message, *args)
+    logging.getLogger("uvicorn.error").info(message, *args)
 
 
 @dataclass
@@ -202,7 +214,18 @@ class Model(nn.Module):
                 if "dialect" not in lang_id:
                     self.supported_languages.append(lang_id)
 
-        self._icl_cache = {}
+        self._icl_cache = OrderedDict()
+        try:
+            self._icl_cache_max_entries = max(
+                1, int(os.getenv("MLX_AUDIO_QWEN_ICL_CACHE_ENTRIES", "32"))
+            )
+        except ValueError:
+            self._icl_cache_max_entries = 32
+        self._model_revision = str(
+            getattr(config, "_commit_hash", "")
+            or getattr(config, "name_or_path", "")
+            or getattr(config, "tts_model_type", "qwen3_tts")
+        )
 
     @property
     def sample_rate(self) -> int:
@@ -211,6 +234,24 @@ class Model(nn.Module):
     @property
     def model_type(self) -> str:
         return "qwen3_tts"
+
+    def _icl_cache_key(self, ref_audio: mx.array, ref_text: str) -> tuple[str, str]:
+        pair_hash = hashlib.sha256()
+        pair_hash.update(np.asarray(ref_audio).tobytes(order="C"))
+        pair_hash.update(b"\0")
+        pair_hash.update(ref_text.encode("utf-8"))
+        return self._model_revision, pair_hash.hexdigest()
+
+    def _get_icl_cache(self, cache_key):
+        cached = self._icl_cache.pop(cache_key, None)
+        if cached is not None:
+            self._icl_cache[cache_key] = cached
+        return cached
+
+    def _put_icl_cache(self, cache_key, value) -> None:
+        self._icl_cache[cache_key] = value
+        while len(self._icl_cache) > self._icl_cache_max_entries:
+            self._icl_cache.popitem(last=False)
 
     def supports_tts_batch(
         self,
@@ -234,7 +275,7 @@ class Model(nn.Module):
         has_ref = ref_audio is not None or ref_text is not None
         if has_ref:
             return (
-                tts_model_type == "base"
+                tts_model_type in {"base", "custom_voice"}
                 and ref_audio is not None
                 and ref_text is not None
                 and voice is None
@@ -636,10 +677,14 @@ class Model(nn.Module):
 
         ref_codes = None
         ref_text_ids = None
-        ref_audio_fingerprint = (ref_audio.size, float(ref_audio.sum()))
-        cache_key = (ref_text, ref_audio_fingerprint)
-        if cache_key in self._icl_cache:
-            ref_codes, ref_text_ids = self._icl_cache[cache_key]
+        cache_key = self._icl_cache_key(ref_audio, ref_text)
+        pair_sha256 = cache_key[1]
+        cached = self._get_icl_cache(cache_key)
+        if cached is not None:
+            ref_codes, ref_text_ids = cached
+            _safe_info("Qwen ICL cache hit pair=%s", pair_sha256[:12])
+        else:
+            _safe_info("Qwen ICL cache miss pair=%s", pair_sha256[:12])
 
         # 1. Encode reference audio -> ref_codes [1, 16, ref_time]
         audio_for_spk = ref_audio  # Save original shape for speaker embedding
@@ -661,7 +706,7 @@ class Model(nn.Module):
 
         if cache_key not in self._icl_cache:
             mx.eval(ref_text_ids)
-            self._icl_cache[cache_key] = (ref_codes, ref_text_ids)
+            self._put_icl_cache(cache_key, (ref_codes, ref_text_ids))
 
         # target_text format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
         target_chat = (
@@ -1202,6 +1247,39 @@ class Model(nn.Module):
             )
             return
 
+        # Check if we should use ICL mode
+        use_icl = (
+            ref_audio is not None
+            and ref_text is not None
+            and self.speech_tokenizer is not None
+            and self.speech_tokenizer.has_encoder
+        )
+
+        if use_icl:
+            # ICL mode needs stronger repetition penalty to prevent code
+            # degeneration with long reference audio prefills
+            icl_rep_penalty = max(repetition_penalty, 1.5)
+            yield from self._generate_icl(
+                text=text,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                language=lang_code,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=icl_rep_penalty,
+                verbose=verbose,
+                stream=stream,
+                streaming_interval=streaming_interval,
+            )
+            return
+
+        if ref_audio is not None and ref_text is not None:
+            raise ValueError(
+                "Reference cloning requires a speech tokenizer with an encoder"
+            )
+
         if tts_model_type == "custom_voice":
             if not voice:
                 raise ValueError(
@@ -1228,33 +1306,6 @@ class Model(nn.Module):
         if self.speech_tokenizer is None:
             raise ValueError("Speech tokenizer not loaded")
 
-        # Check if we should use ICL mode
-        use_icl = (
-            ref_audio is not None
-            and ref_text is not None
-            and self.speech_tokenizer.has_encoder
-        )
-
-        if use_icl:
-            # ICL mode needs stronger repetition penalty to prevent code
-            # degeneration with long reference audio prefills
-            icl_rep_penalty = max(repetition_penalty, 1.5)
-            yield from self._generate_icl(
-                text=text,
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                language=lang_code,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=icl_rep_penalty,
-                verbose=verbose,
-                stream=stream,
-                streaming_interval=streaming_interval,
-            )
-            return
-
         if voice is not None and voice.lower() not in [
             s.lower() for s in self.supported_speakers
         ]:
@@ -1268,7 +1319,6 @@ class Model(nn.Module):
                     else ""
                 )
             )
-
         # Split text into segments
         if split_pattern:
             segments = [s.strip() for s in text.split(split_pattern) if s.strip()]

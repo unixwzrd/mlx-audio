@@ -1,5 +1,7 @@
 # Guides
 
+- [Remote Reference Registry (unixwzrd fork)](remote-reference-registry.md)
+
 Practical how-to guides for common mlx-audio workflows.
 
 <div class="grid cards" markdown>
